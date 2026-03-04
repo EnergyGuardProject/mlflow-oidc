@@ -1,0 +1,60 @@
+version: "3.8"
+
+services:
+  mlflow-oidc:
+    container_name: mlflow-oidc
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlflow-oidc:latest
+    ports:
+      - "5001:5001"
+
+    env_file:
+      - .env
+
+    restart: unless-stopped
+    networks:
+      - nginxproxy_energyguard_net
+    command: bash -c 
+      "mlflow server 
+        --host 0.0.0.0 
+        --port 5001 
+        --app-name oidc-auth
+        --backend-store-uri postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgdb:5432/${POSTGRES_DATABASE} 
+        --artifacts-destination s3://${BUCKET_NAME}/ 
+        --allowed-hosts mlflow.energy-guard.eu,localhost:*,mlflow-oidc:*,mlflow-proxy:*
+        --serve-artifacts"
+    volumes:
+      - mlflow_oidc_state:/mlflow
+
+  mlflow-proxy:
+    container_name: mlflow-proxy
+    build:
+      context: ./mlflow-proxy
+      dockerfile: Dockerfile
+    image: mlflow-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "8069:8069"
+    environment:
+      MLFLOW_UPSTREAM_URL: http://mlflow-oidc:5001
+      ADMIN_GROUP_NAME: mlflow-admins
+      TOKEN_HEADER_CANDIDATES: authorization,x-forwarded-access-token,x-auth-request-access-token
+      REQUEST_TIMEOUT_SECONDS: "60"
+      KEYCLOAK_LOGOUT_CLIENT_ID: mlflow-energyguard
+      KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES: x-auth-request-id-token,x-forwarded-id-token,authorization
+      KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME: ""
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+    networks:
+      - nginxproxy_energyguard_net
+
+
+volumes:
+  mlflow_data:
+  mlflow_oidc_state:
+
+networks:
+    nginxproxy_energyguard_net:
+        external: true    
