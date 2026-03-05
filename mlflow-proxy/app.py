@@ -2,8 +2,7 @@ import base64
 import hmac
 import json
 import os
-from typing import Iterable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -12,14 +11,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 MLFLOW_UPSTREAM_URL = os.getenv("MLFLOW_UPSTREAM_URL", "https://mlflow.energy-guard.eu").rstrip("/")
 ADMIN_GROUP_NAME = os.getenv("ADMIN_GROUP_NAME", "mlflow-admins")
-TOKEN_HEADER_CANDIDATES = tuple(
-    header.strip().lower()
-    for header in os.getenv(
-        "TOKEN_HEADER_CANDIDATES",
-        "authorization,x-forwarded-access-token,x-auth-request-access-token",
-    ).split(",")
-    if header.strip()
-)
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
 KEYCLOAK_LOGOUT_CLIENT_ID = os.getenv("KEYCLOAK_LOGOUT_CLIENT_ID", "").strip()
 KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES = tuple(
@@ -58,49 +49,6 @@ def _split_jwt(token: str) -> list[str]:
     parts = token.split(".")
     return parts if len(parts) == 3 else []
 
-
-def _decode_base64url(raw: str) -> bytes:
-    padding = "=" * (-len(raw) % 4)
-    return base64.urlsafe_b64decode(raw + padding)
-
-
-def _decode_jwt_payload(token: str) -> dict:
-    parts = _split_jwt(token)
-    if not parts:
-        return {}
-
-    try:
-        return json.loads(_decode_base64url(parts[1]).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError):
-        return {}
-
-
-def _normalize_group_name(group_name: str) -> str:
-    return group_name.rsplit("/", 1)[-1].strip()
-
-
-def _iter_groups(payload: dict) -> Iterable[str]:
-    groups = payload.get("groups")
-    if isinstance(groups, list):
-        for group_name in groups:
-            if isinstance(group_name, str):
-                yield _normalize_group_name(group_name)
-
-
-def _extract_access_token(request: Request) -> str | None:
-    for header_name in TOKEN_HEADER_CANDIDATES:
-        raw_value = request.headers.get(header_name)
-        if not raw_value:
-            continue
-        if header_name == "authorization":
-            scheme, _, token = raw_value.partition(" ")
-            if scheme.lower() != "bearer" or not token:
-                continue
-            return token.strip()
-        return raw_value.strip()
-    return None
-
-
 def _decode_basic_auth_credentials(request: Request) -> tuple[str, str] | None:
     raw_authorization = request.headers.get("authorization", "")
     scheme, _, encoded_credentials = raw_authorization.partition(" ")
@@ -130,16 +78,28 @@ def _is_service_account_request(request: Request) -> bool:
     )
 
 
-def _is_admin(request: Request) -> bool:
-    token = _extract_access_token(request)
-    if not token:
-        return False
+def _decode_flask_session_payload(cookie_value: str) -> dict:
+    if not cookie_value:
+        return {}
 
-    payload = _decode_jwt_payload(token)
-    if not payload:
-        return False
+    payload_segment = cookie_value.split(".", 1)[0].strip()
+    if not payload_segment:
+        return {}
 
-    return ADMIN_GROUP_NAME in set(_iter_groups(payload))
+    padding = "=" * (-len(payload_segment) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload_segment + padding).decode("utf-8")
+        payload = json.loads(decoded)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _extract_session_username(request: Request) -> str:
+    session_payload = _decode_flask_session_payload(request.cookies.get("session", ""))
+    username = session_payload.get("username", "")
+    return username.strip().lower() if isinstance(username, str) else ""
 
 
 def _is_ui_request(path: str) -> bool:
@@ -272,6 +232,45 @@ def _build_upstream_headers(request: Request) -> dict[str, str]:
 
     headers.setdefault("x-forwarded-proto", request.url.scheme)
     return headers
+
+
+async def _is_admin_api_call(request: Request, username) -> set[str]:
+    users_url = httpx.URL(f"{MLFLOW_UPSTREAM_URL}/api/2.0/mlflow/users/{username}")
+    headers = _build_upstream_headers(request)
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+            response = await client.get(users_url, headers=headers)
+    except httpx.HTTPError:
+        return set()
+
+    print("response", response)
+    if response.status_code != 200:
+        return set()
+
+    try:
+        payload = response.json()
+        print(payload)
+        is_admin = payload['is_admin']
+        print(is_admin)
+    except json.JSONDecodeError:
+        is_admin = False
+    if not isinstance(payload, dict):
+        is_admin = False
+
+    return is_admin
+
+
+async def _is_admin(request: Request) -> bool:
+    session_username = _extract_session_username(request)
+    print("session_username", session_username)
+    if not session_username:
+        return False
+
+    if MLFLOW_TRACKING_USERNAME and session_username == MLFLOW_TRACKING_USERNAME.lower():
+        return True
+
+    return await _is_admin_api_call(request, session_username)
 
 
 def _extract_logout_id_token(request: Request) -> str | None:
@@ -414,7 +413,9 @@ async def healthcheck() -> dict[str, str]:
 async def proxy(path: str, request: Request) -> Response:
     normalized_path = "/" + path.lstrip("/")
 
-    if not _is_service_account_request(request) and not _is_admin(request) and _is_blocked_for_non_admin(normalized_path):
+    if _is_blocked_for_non_admin(normalized_path) and not _is_service_account_request(request) and not await _is_admin(
+        request
+    ):
         if _is_ui_request(normalized_path):
             return await _forbidden_ui_response(request, normalized_path)
         return _forbidden_api_response(normalized_path)

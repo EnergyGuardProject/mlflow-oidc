@@ -19,15 +19,14 @@ Blocked API requests return MLflow-style JSON `403` responses (`error_code` + `m
 
 Blocked UI requests under `/oidc/ui` return the normal MLflow HTML shell with an injected full-screen "Access denied" overlay, so the user stays inside the MLflow page instead of being sent to a separate custom page.
 
-## Token lookup
+## Group lookup
 
-The proxy checks these headers in order and uses the first one that exists:
+The proxy resolves admin access by calling:
+`GET /api/2.0/mlflow/permissions/groups/{ADMIN_GROUP_NAME}/users`
+on the upstream MLflow OIDC server and checking whether the current session `username` is in that list.
 
-1. `Authorization: Bearer <token>`
-2. `X-Forwarded-Access-Token`
-3. `X-Auth-Request-Access-Token`
-
-The JWT payload is decoded locally and the `groups` claim is checked for `mlflow-admins`.
+The proxy also allows a single machine account by matching the signed
+session `username` against `MLFLOW_TRACKING_USERNAME`.
 
 ## Service account passthrough
 
@@ -53,7 +52,6 @@ Point Nginx Proxy Manager at the `mlflow-proxy` container instead of the `mlflow
 
 - `MLFLOW_UPSTREAM_URL` (default in code: `https://mlflow.energy-guard.eu`, default in compose: `http://mlflow-oidc:5001`)
 - `ADMIN_GROUP_NAME` (default: `mlflow-admins`)
-- `TOKEN_HEADER_CANDIDATES` (default: `authorization,x-forwarded-access-token,x-auth-request-access-token`)
 - `REQUEST_TIMEOUT_SECONDS` (default: `60`)
 - `KEYCLOAK_LOGOUT_CLIENT_ID` (optional fallback; used only when no `id_token_hint` is available)
 - `KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES` (default: `x-auth-request-id-token,x-forwarded-id-token,authorization`)

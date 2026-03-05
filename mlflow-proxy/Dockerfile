@@ -12,4 +12,4 @@ COPY app.py .
 
 EXPOSE 8069
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8069"]
+CMD ["python", "-u", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8069", "--log-level", "debug", "--access-log"]

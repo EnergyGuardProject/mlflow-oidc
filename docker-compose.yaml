@@ -40,7 +40,6 @@ services:
     environment:
       MLFLOW_UPSTREAM_URL: http://mlflow-oidc:5001
       ADMIN_GROUP_NAME: mlflow-admins
-      TOKEN_HEADER_CANDIDATES: authorization,x-forwarded-access-token,x-auth-request-access-token
       REQUEST_TIMEOUT_SECONDS: "60"
       KEYCLOAK_LOGOUT_CLIENT_ID: mlflow-energyguard
       KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES: x-auth-request-id-token,x-forwarded-id-token,authorization
