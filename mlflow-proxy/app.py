@@ -118,8 +118,8 @@ def _forbidden_message(path: str) -> str:
     # if _is_ui_request(path):
     #     return f"MLflow UI access is restricted to members of the {ADMIN_GROUP_NAME} Keycloak group."
     if path.startswith("/api/2.0/mlflow/permissions/") or path.startswith("/ajax-api/2.0/mlflow/permissions/"):
-        return f"Permission management is restricted to members of the {ADMIN_GROUP_NAME} Keycloak group."
-    return f"This MLflow action is restricted to members of the {ADMIN_GROUP_NAME} Keycloak group."
+        return f"Permission management is restricted to MLflow admins."
+    return f"This MLflow action is restricted to MLflow admins."
 
 
 def _forbidden_api_response(path: str) -> Response:
