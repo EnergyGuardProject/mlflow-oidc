@@ -2,14 +2,36 @@ import base64
 import hmac
 import json
 import os
+import re
+import time
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+import logging
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+logger = logging.getLogger("mlflow-proxy")
+logging.basicConfig(level=logging.DEBUG)
 
 MLFLOW_UPSTREAM_URL = os.getenv("MLFLOW_UPSTREAM_URL", "https://mlflow.energy-guard.eu").rstrip("/")
+SESSION_COOKIE_MAX_AGE = int(os.getenv("SESSION_COOKIE_MAX_AGE", "300"))
+KEYCLOAK_ISSUER_URL = os.getenv("KC_ISSUER_URL", "").rstrip("/")
+
+# ---------------------------------------------------------------------------
+# Backchannel logout: in-memory revocation list
+# ---------------------------------------------------------------------------
+# When Keycloak terminates a session (user logs out from *any* app in the
+# realm), it POSTs a logout_token JWT to every client's backchannel-logout
+# URL.  We decode the token, extract the username, and keep it in a
+# revocation dict.  On subsequent requests the proxy checks this dict and,
+# if the user is revoked, deletes the session cookie and forces re-auth.
+#
+# Entries auto-expire after 2 * SESSION_COOKIE_MAX_AGE seconds — by that
+# point the browser would have discarded the cookie anyway.
+# ---------------------------------------------------------------------------
+_revoked_users: dict[str, float] = {}  # username -> monotonic timestamp
 ADMIN_GROUP_NAME = os.getenv("ADMIN_GROUP_NAME", "mlflow-admins")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
 KEYCLOAK_LOGOUT_CLIENT_ID = os.getenv("KEYCLOAK_LOGOUT_CLIENT_ID", "").strip()
@@ -43,6 +65,147 @@ BLOCKED_PREFIXES = (
 )
 
 app = FastAPI(title="MLflow Role Proxy")
+
+
+# ---------------------------------------------------------------------------
+# Backchannel-logout helpers
+# ---------------------------------------------------------------------------
+
+def _revoke_user(username: str) -> None:
+    """Mark *username* as logged-out.  Also lazily purge stale entries."""
+    _revoked_users[username.lower()] = time.monotonic()
+    cutoff = time.monotonic() - (SESSION_COOKIE_MAX_AGE * 2)
+    for key in [k for k, ts in _revoked_users.items() if ts < cutoff]:
+        _revoked_users.pop(key, None)
+
+
+def _is_user_revoked(username: str) -> bool:
+    ts = _revoked_users.get(username.lower())
+    if ts is None:
+        return False
+    if time.monotonic() - ts > SESSION_COOKIE_MAX_AGE * 2:
+        _revoked_users.pop(username.lower(), None)
+        return False
+    return True
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """Return the *unverified* payload of a JWT (used for logout tokens)."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    seg = parts[1]
+    seg += "=" * (-len(seg) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(seg))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+@app.get("/backchannel-logout")
+async def backchannel_logout_info() -> dict:
+    """Browser-friendly check — confirms the endpoint is live."""
+    return {
+        "endpoint": "/backchannel-logout",
+        "method": "POST",
+        "description": "Keycloak backchannel logout receiver. Configure this URL in Keycloak client settings.",
+        "revoked_users_count": len(_revoked_users),
+        "revoked_users": list(_revoked_users.keys()),
+        "keycloak_admin_api_configured": bool(KEYCLOAK_ISSUER_URL and os.getenv("KC_CLIENT_ID") and os.getenv("KC_CLIENT_SECRET")),
+    }
+
+
+async def _resolve_keycloak_sub_to_email(sub: str) -> str | None:
+    """Call the Keycloak admin API to resolve a user UUID to an email.
+
+    Uses the service-account client-credentials grant to obtain an admin
+    token, then fetches the user by ID.
+    """
+    if not KEYCLOAK_ISSUER_URL:
+        return None
+
+    client_id = os.getenv("KC_CLIENT_ID", "").strip()
+    client_secret = os.getenv("KC_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return None
+
+    token_url = f"{KEYCLOAK_ISSUER_URL}/protocol/openid-connect/token"
+    # The admin API base is two levels up from the realm issuer
+    # e.g. https://keycloak.example.com/realms/MyRealm -> https://keycloak.example.com/admin/realms/MyRealm
+    admin_base = KEYCLOAK_ISSUER_URL.replace("/realms/", "/admin/realms/")
+    user_url = f"{admin_base}/users/{sub}"
+
+    timeout = httpx.Timeout(10)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            token_resp = await client.post(
+                token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+            )
+            if token_resp.status_code != 200:
+                logger.warning("Keycloak token request failed: %s %s", token_resp.status_code, token_resp.text[:200])
+                return None
+            access_token = token_resp.json().get("access_token")
+
+            user_resp = await client.get(
+                user_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if user_resp.status_code != 200:
+                logger.warning("Keycloak user lookup failed for sub=%s: %s", sub, user_resp.status_code)
+                return None
+            user_data = user_resp.json()
+            email = user_data.get("email", "").strip().lower()
+            logger.info("Resolved Keycloak sub=%s -> email=%s", sub, email)
+            return email or None
+    except Exception as e:
+        logger.error("Keycloak API error resolving sub=%s: %s", sub, e)
+        return None
+
+
+@app.post("/backchannel-logout")
+async def backchannel_logout(request: Request) -> Response:
+    """Receive a Keycloak backchannel logout notification.
+
+    Keycloak POSTs ``application/x-www-form-urlencoded`` with a single
+    ``logout_token`` field containing a signed JWT.  We decode the payload
+    and extract the user's e-mail so we can add it to the revocation list.
+
+    The logout_token typically only contains ``sub`` (a Keycloak UUID), not
+    the email.  When ``email`` / ``preferred_username`` are absent, we call
+    the Keycloak admin API to resolve sub -> email.
+    """
+    form = await request.form()
+    logout_token = form.get("logout_token", "")
+    if not logout_token:
+        logger.warning("backchannel-logout: missing logout_token")
+        return JSONResponse(status_code=400, content={"error": "missing logout_token"})
+
+    payload = _decode_jwt_payload(str(logout_token))
+    logger.info("backchannel-logout payload: %s", json.dumps(payload, default=str))
+    if not payload:
+        return JSONResponse(status_code=400, content={"error": "invalid logout_token"})
+
+    # Try to get the email directly from the token (some Keycloak configs include it)
+    username = payload.get("email") or payload.get("preferred_username")
+
+    # Fall back: resolve the sub UUID via the Keycloak admin API
+    if not username:
+        sub = payload.get("sub", "")
+        if sub:
+            username = await _resolve_keycloak_sub_to_email(sub)
+
+    if not username:
+        logger.warning("backchannel-logout: cannot determine user from token: %s", payload)
+        return JSONResponse(status_code=400, content={"error": "cannot determine user from logout_token"})
+
+    _revoke_user(username)
+    logger.info("backchannel-logout: revoked user %s, total revoked: %d", username, len(_revoked_users))
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 
 def _split_jwt(token: str) -> list[str]:
@@ -297,6 +460,27 @@ def _extract_logout_id_token(request: Request) -> str | None:
     return None
 
 
+def _rewrite_session_cookie_max_age(cookie_value: str) -> str:
+    """Rewrite the session cookie's Max-Age so it expires sooner.
+
+    Starlette's SessionMiddleware defaults to 14-day Max-Age with no knob
+    exposed by mlflow-oidc-auth.  By shortening it at the proxy layer the
+    browser will discard the cookie after SESSION_COOKIE_MAX_AGE seconds of
+    inactivity, forcing a new OIDC login flow.  If the Keycloak session was
+    killed (e.g. the user logged out via another app) that re-auth will
+    redirect to the Keycloak login page — effectively providing single-logout.
+    """
+    if re.search(r"(?i)\bmax-age\s*=\s*\d+", cookie_value):
+        cookie_value = re.sub(
+            r"(?i)\bmax-age\s*=\s*\d+",
+            f"Max-Age={SESSION_COOKIE_MAX_AGE}",
+            cookie_value,
+        )
+    else:
+        cookie_value += f"; Max-Age={SESSION_COOKIE_MAX_AGE}"
+    return cookie_value
+
+
 def _rewrite_logout_location(path: str, request: Request, headers: dict[str, str]) -> dict[str, str]:
     if path != "/logout":
         return headers
@@ -390,18 +574,32 @@ async def _forward_request(request: Request, path: str) -> Response:
             headers=headers,
         )
 
-    response_headers = {
-        key: value
-        for key, value in upstream_response.headers.items()
-        if key.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}
-    }
+    skip_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    response_headers: dict[str, str] = {}
+    set_cookie_headers: list[str] = []
+
+    for key, value in upstream_response.headers.items():
+        if key.lower() in skip_headers:
+            continue
+        if key.lower() == "set-cookie":
+            # Collect Set-Cookie headers separately so duplicates are preserved.
+            if value.startswith("session="):
+                value = _rewrite_session_cookie_max_age(value)
+            set_cookie_headers.append(value)
+        else:
+            response_headers[key] = value
+
     response_headers = _rewrite_logout_location(path, request, response_headers)
-    return Response(
+
+    response = Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,
         headers=response_headers,
         media_type=upstream_response.headers.get("content-type"),
     )
+    for cookie_header in set_cookie_headers:
+        response.headers.append("set-cookie", cookie_header)
+    return response
 
 
 @app.get("/healthz")
@@ -412,6 +610,18 @@ async def healthcheck() -> dict[str, str]:
 @app.api_route("/{path:path}", methods=ALL_METHODS)
 async def proxy(path: str, request: Request) -> Response:
     normalized_path = "/" + path.lstrip("/")
+
+    # Backchannel logout: if Keycloak revoked this user's session, delete the
+    # cookie immediately and force a fresh OIDC login.  Remove the user from
+    # the revocation list afterwards so the fresh login (which just went
+    # through Keycloak) is not blocked again.
+    session_username = _extract_session_username(request)
+    if session_username and _is_user_revoked(session_username):
+        _revoked_users.pop(session_username.lower(), None)
+        logger.info("Revocation consumed for %s — deleting cookie and redirecting", session_username)
+        response = Response(status_code=302, headers={"location": "/"})
+        response.delete_cookie("session", path="/")
+        return response
 
     if _is_blocked_for_non_admin(normalized_path) and not _is_service_account_request(request) and not await _is_admin(
         request
