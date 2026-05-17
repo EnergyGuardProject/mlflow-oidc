@@ -494,6 +494,38 @@ def _rewrite_session_cookie_max_age(cookie_value: str) -> str:
     return cookie_value
 
 
+def _build_keycloak_logout_url(request: Request) -> str | None:
+    """Construct Keycloak's RP-initiated logout URL.
+
+    Returns None when the issuer URL or the client identifier are missing —
+    in that case there is nothing safe to redirect to, so callers should fall
+    back to leaving the upstream redirect alone.
+    """
+    if not KEYCLOAK_ISSUER_URL:
+        return None
+
+    id_token_hint = _extract_logout_id_token(request)
+    if not id_token_hint and not KEYCLOAK_LOGOUT_CLIENT_ID:
+        return None
+
+    original_host = request.headers.get("host", "").strip()
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    post_logout_redirect = f"{proto}://{original_host}/" if original_host else None
+
+    query_items: list[tuple[str, str]] = []
+    if id_token_hint:
+        query_items.append(("id_token_hint", id_token_hint))
+    if KEYCLOAK_LOGOUT_CLIENT_ID:
+        query_items.append(("client_id", KEYCLOAK_LOGOUT_CLIENT_ID))
+    if post_logout_redirect:
+        query_items.append(("post_logout_redirect_uri", post_logout_redirect))
+
+    return (
+        f"{KEYCLOAK_ISSUER_URL}/protocol/openid-connect/logout?"
+        + urlencode(query_items, doseq=True)
+    )
+
+
 def _rewrite_logout_location(path: str, request: Request, headers: dict[str, str]) -> dict[str, str]:
     if path != "/logout":
         return headers
@@ -504,33 +536,44 @@ def _rewrite_logout_location(path: str, request: Request, headers: dict[str, str
 
     location = headers[location_key]
     parsed = urlsplit(location)
-    if "/protocol/openid-connect/logout" not in parsed.path:
-        return headers
 
-    query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    query_keys = {key for key, _ in query_items}
-    if "id_token_hint" in query_keys:
-        return headers
-    if "post_logout_redirect_uri" not in query_keys:
-        return headers
+    if "/protocol/openid-connect/logout" in parsed.path:
+        # Upstream already points at Keycloak; just enrich the query with
+        # id_token_hint or client_id so the IdP can identify the session.
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        query_keys = {key for key, _ in query_items}
+        if "id_token_hint" in query_keys:
+            return headers
+        if "post_logout_redirect_uri" not in query_keys:
+            return headers
 
-    id_token_hint = _extract_logout_id_token(request)
-    if id_token_hint:
-        query_items.append(("id_token_hint", id_token_hint))
-    elif "client_id" not in query_keys and KEYCLOAK_LOGOUT_CLIENT_ID:
-        query_items.append(("client_id", KEYCLOAK_LOGOUT_CLIENT_ID))
-    else:
-        return headers
+        id_token_hint = _extract_logout_id_token(request)
+        if id_token_hint:
+            query_items.append(("id_token_hint", id_token_hint))
+        elif "client_id" not in query_keys and KEYCLOAK_LOGOUT_CLIENT_ID:
+            query_items.append(("client_id", KEYCLOAK_LOGOUT_CLIENT_ID))
+        else:
+            return headers
 
-    headers[location_key] = urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urlencode(query_items, doseq=True),
-            parsed.fragment,
+        headers[location_key] = urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(query_items, doseq=True),
+                parsed.fragment,
+            )
         )
-    )
+        return headers
+
+    # Upstream cleared the local Flask session but redirected to a local
+    # page (e.g. /oidc/ui/auth).  Keycloak's SSO session is still alive, so
+    # the next /login would silently re-authenticate — meaning "logout"
+    # didn't really log the user out.  Force a redirect to Keycloak's
+    # end_session_endpoint instead.
+    keycloak_url = _build_keycloak_logout_url(request)
+    if keycloak_url:
+        headers[location_key] = keycloak_url
     return headers
 
 
