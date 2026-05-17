@@ -55,10 +55,12 @@ BLOCKED_EXACT_PATHS = {
     "/api/2.0/mlflow/experiments/update",
     "/api/2.0/mlflow/experiments/delete",
     "/api/2.0/mlflow/experiments/set-experiment-tag",
+    "/api/2.0/mlflow/experiments/delete-experiment-tag",
     "/ajax-api/2.0/mlflow/experiments/create",
     "/ajax-api/2.0/mlflow/experiments/update",
     "/ajax-api/2.0/mlflow/experiments/delete",
     "/ajax-api/2.0/mlflow/experiments/set-experiment-tag",
+    "/ajax-api/2.0/mlflow/experiments/delete-experiment-tag",
 }
 BLOCKED_PREFIXES = (
     "/api/2.0/mlflow/permissions/",
