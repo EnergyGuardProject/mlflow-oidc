@@ -61,10 +61,21 @@ BLOCKED_EXACT_PATHS = {
     "/ajax-api/2.0/mlflow/experiments/delete",
     "/ajax-api/2.0/mlflow/experiments/set-experiment-tag",
     "/ajax-api/2.0/mlflow/experiments/delete-experiment-tag",
+    # List-of-users / list-of-service-accounts.  The OIDC UI's Users and
+    # Service Accounts pages both fetch this — service accounts uses the
+    # ?service=true query param.  /api/2.0/mlflow/users/current and
+    # /api/2.0/mlflow/users/<email> remain accessible (they are different
+    # paths under the same prefix).
+    "/api/2.0/mlflow/users",
+    "/ajax-api/2.0/mlflow/users",
+    "/oidc/ui/users",
+    "/oidc/ui/service-accounts",
 }
 BLOCKED_PREFIXES = (
     "/api/2.0/mlflow/permissions/",
     "/ajax-api/2.0/mlflow/permissions/",
+    "/oidc/ui/users/",
+    "/oidc/ui/service-accounts/",
 )
 # set-experiment-tag is admin-only — except for these specific tag keys, which
 # are user-facing UI affordances rather than relationship metadata.
@@ -305,19 +316,18 @@ async def _is_allowed_set_experiment_tag(request: Request, path: str) -> bool:
 
 
 def _forbidden_message(path: str) -> str:
+    if path.startswith("/oidc/ui/users") or path.startswith("/oidc/ui/service-accounts"):
+        return "This page is restricted to MLflow administrators."
     if path.startswith("/api/2.0/mlflow/permissions/") or path.startswith("/ajax-api/2.0/mlflow/permissions/"):
         return "Permission management is restricted to MLflow admins."
     return "This MLflow action is restricted to MLflow admins."
 
 
-def _forbidden_api_response(path: str) -> Response:
+def _forbidden_response(request: Request, path: str) -> Response:
     message = _forbidden_message(path)
     return JSONResponse(
         status_code=403,
-        content={
-            "error_code": "PERMISSION_DENIED",
-            "message": message,
-        },
+        content={"error_code": "PERMISSION_DENIED", "message": message},
         headers={"X-MLflow-Proxy-Error": message},
     )
 
@@ -627,6 +637,19 @@ _LOGO_JS = """(function(){
   console.log('[eg-proxy] logo replacement loaded');
   var L='/eg-static/logo.png';
   var H='42px';
+  // Cached promise resolving to true iff the current user is_admin.
+  // We only call the API once per page; subsequent passes reuse the result.
+  var _adminPromise=null;
+  function isAdmin(){
+    if(_adminPromise)return _adminPromise;
+    _adminPromise=fetch('/api/2.0/mlflow/users/current',{
+      credentials:'include',
+      headers:{'Accept':'application/json'}
+    }).then(function(r){return r.ok?r.json():null;})
+      .then(function(d){return !!(d&&d.is_admin===true);})
+      .catch(function(){return false;});
+    return _adminPromise;
+  }
   function applyLogo(im){
     im.src=L;
     im.alt='EnergyGuard';
@@ -637,6 +660,23 @@ _LOGO_JS = """(function(){
     im.style.setProperty('max-height','none','important');
     im.style.verticalAlign='middle';
     im.style.objectFit='contain';
+  }
+  function hidePermissionsLink(){
+    // Don't touch the OIDC plugin's own UI (it lives at /oidc/*) — only
+    // hide the "Permissions" entry that mlflow-oidc-auth injects into
+    // MLflow's own top-right nav, and only for non-admins.
+    if(window.location.pathname.indexOf('/oidc/')===0)return;
+    isAdmin().then(function(admin){
+      if(admin)return;
+      var anchors=document.querySelectorAll('header a');
+      for(var i=0;i<anchors.length;i++){
+        var a=anchors[i];
+        if((a.textContent||'').trim()!=='Permissions')continue;
+        if(a.getAttribute('data-eg-hidden')==='1')continue;
+        a.style.setProperty('display','none','important');
+        a.setAttribute('data-eg-hidden','1');
+      }
+    });
   }
   function r(){
     // Brand anchor selectors:
@@ -683,6 +723,7 @@ _LOGO_JS = """(function(){
         for(var h=0;h<hidden.length;h++)hidden[h].style.display='';
       }
     }
+    hidePermissionsLink();
   }
   function start(){
     r();
@@ -729,6 +770,6 @@ async def proxy(path: str, request: Request) -> Response:
         request
     ):
         if not await _is_allowed_set_experiment_tag(request, normalized_path):
-            return _forbidden_api_response(normalized_path)
+            return _forbidden_response(request, normalized_path)
 
     return await _forward_request(request, normalized_path)
