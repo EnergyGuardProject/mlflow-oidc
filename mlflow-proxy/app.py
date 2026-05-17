@@ -64,6 +64,15 @@ BLOCKED_PREFIXES = (
     "/api/2.0/mlflow/permissions/",
     "/ajax-api/2.0/mlflow/permissions/",
 )
+# set-experiment-tag is admin-only — except for these specific tag keys, which
+# are user-facing UI affordances rather than relationship metadata.
+SET_EXPERIMENT_TAG_PATHS = {
+    "/api/2.0/mlflow/experiments/set-experiment-tag",
+    "/ajax-api/2.0/mlflow/experiments/set-experiment-tag",
+}
+ALLOWED_EXPERIMENT_TAG_KEYS = {
+    "mlflow.experimentKind",  # MLflow 3.x experiment-type popup
+}
 
 app = FastAPI(title="MLflow Role Proxy")
 
@@ -269,6 +278,28 @@ def _is_blocked_for_non_admin(path: str) -> bool:
     if path in BLOCKED_EXACT_PATHS:
         return True
     return any(path.startswith(prefix) for prefix in BLOCKED_PREFIXES)
+
+
+async def _is_allowed_set_experiment_tag(request: Request, path: str) -> bool:
+    """Peek at a set-experiment-tag POST body and decide whether to let it
+    through despite the user not being an admin.
+
+    The path-level block on set-experiment-tag exists so users can't rewrite
+    project / ownership metadata.  But MLflow's UI also writes
+    ``mlflow.experimentKind`` here when the user picks an experiment type
+    from the popup — a benign UI affordance.  Allow that exact key and
+    nothing else.
+    """
+    if path not in SET_EXPERIMENT_TAG_PATHS:
+        return False
+    try:
+        body = await request.body()  # Starlette caches this; safe to call again later.
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("key") in ALLOWED_EXPERIMENT_TAG_KEYS
 
 
 def _forbidden_message(path: str) -> str:
@@ -695,6 +726,7 @@ async def proxy(path: str, request: Request) -> Response:
     if _is_blocked_for_non_admin(normalized_path) and not _is_service_account_request(request) and not await _is_admin(
         request
     ):
-        return _forbidden_api_response(normalized_path)
+        if not await _is_allowed_set_experiment_tag(request, normalized_path):
+            return _forbidden_api_response(normalized_path)
 
     return await _forward_request(request, normalized_path)
