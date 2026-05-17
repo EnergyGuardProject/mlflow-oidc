@@ -135,9 +135,8 @@ async def _resolve_keycloak_sub_to_email(sub: str) -> str | None:
     admin_base = KEYCLOAK_ISSUER_URL.replace("/realms/", "/admin/realms/")
     user_url = f"{admin_base}/users/{sub}"
 
-    timeout = httpx.Timeout(10)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS)) as client:
             token_resp = await client.post(
                 token_url,
                 data={
@@ -458,6 +457,18 @@ def _extract_logout_id_token(request: Request) -> str | None:
             return cookie_value
 
     return None
+
+
+def _username_from_set_cookie(set_cookie_value: str) -> str:
+    """Decode the Flask session payload out of a ``Set-Cookie: session=…`` header."""
+    cookie_part = set_cookie_value.split(";", 1)[0]
+    _, _, raw_value = cookie_part.partition("=")
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return ""
+    payload = _decode_flask_session_payload(raw_value)
+    username = payload.get("username", "")
+    return username.strip().lower() if isinstance(username, str) else ""
 
 
 def _rewrite_session_cookie_max_age(cookie_value: str) -> str:
