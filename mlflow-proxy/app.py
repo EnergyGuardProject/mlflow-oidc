@@ -10,7 +10,7 @@ import logging
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 logger = logging.getLogger("mlflow-proxy")
 logging.basicConfig(level=logging.DEBUG)
@@ -46,6 +46,8 @@ KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES = tuple(
 KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME = os.getenv("KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME", "").strip()
 MLFLOW_TRACKING_USERNAME = os.getenv("MLFLOW_TRACKING_USERNAME", "").strip()
 MLFLOW_TRACKING_PASSWORD = os.getenv("MLFLOW_TRACKING_PASSWORD", "").strip()
+EG_LOGO_PATH = os.getenv("EG_LOGO_PATH", "/app/images/logo/EnergyGuard_Site-1024x640.png")
+EG_LOGO_URL = "/eg-static/logo.png"
 
 ALL_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
 UI_PATHS = ("/oidc/ui", "/oidc/ui/")
@@ -602,8 +604,12 @@ async def _forward_request(request: Request, path: str) -> Response:
 
     response_headers = _rewrite_logout_location(path, request, response_headers)
 
+    content = upstream_response.content
+    if "text/html" in upstream_response.headers.get("content-type", "").lower():
+        content = _inject_logo_replacement(content)
+
     response = Response(
-        content=upstream_response.content,
+        content=content,
         status_code=upstream_response.status_code,
         headers=response_headers,
         media_type=upstream_response.headers.get("content-type"),
@@ -616,6 +622,121 @@ async def _forward_request(request: Request, path: str) -> Response:
 @app.get("/healthz")
 async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/eg-static/logo.png")
+async def eg_logo() -> Response:
+    if not os.path.exists(EG_LOGO_PATH):
+        return Response(status_code=404)
+    return FileResponse(
+        EG_LOGO_PATH,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/eg-static/logo.js")
+async def eg_logo_js() -> Response:
+    return Response(
+        content=_LOGO_JS,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=60"},
+    )
+
+
+# Replaces MLflow's top-left logo with the EnergyGuard wordmark.
+#
+# MLflow's top bar IS a <header> element (class css-ehv30l) but the home
+# anchor uses href="#/" — same as the sidebar "Home" link.  To pick out only
+# the header logo we filter on viewport position: the header anchor is at
+# rect.top < 100, the sidebar Home link is much further down.
+#
+# The script is served as an external resource (not inlined) so MLflow's CSP
+# doesn't block it.  Reload check: GET /eg-static/logo.js should return 200.
+_LOGO_JS = """(function(){
+  console.log('[eg-proxy] logo replacement loaded');
+  var L='/eg-static/logo.png';
+  var H='42px';
+  function applyLogo(im){
+    im.src=L;
+    im.alt='EnergyGuard';
+    im.setAttribute('data-eg-logo','1');
+    im.style.setProperty('height',H,'important');
+    im.style.setProperty('width','auto','important');
+    im.style.setProperty('max-width','none','important');
+    im.style.setProperty('max-height','none','important');
+    im.style.verticalAlign='middle';
+    im.style.objectFit='contain';
+  }
+  function r(){
+    // Brand anchor selectors:
+    //  - MLflow main UI : <a href="#/"> (hash routing)
+    //  - mlflow-oidc UI : <a class="text-logo" href="…dynamic…">
+    // Deliberately NOT matching a[href="/"] — that is a nav-menu link on
+    // the OIDC pages ("MLFlow"), not the brand.
+    var ls=document.querySelectorAll('a[href="#/"],a[href="/#/"],a.text-logo');
+    for(var i=0;i<ls.length;i++){
+      var a=ls[i];
+      var rc=a.getBoundingClientRect();
+      if(rc.width===0&&rc.height===0)continue;
+      if(rc.top>100)continue;
+      var kids=a.querySelectorAll('svg,img:not([data-eg-logo])');
+      for(var j=0;j<kids.length;j++){
+        if(kids[j].style.display!=='none')kids[j].style.display='none';
+      }
+      if(!a.querySelector('img[data-eg-logo]')){
+        var im=document.createElement('img');
+        applyLogo(im);
+        a.insertBefore(im,a.firstChild);
+      }
+      // Rewrite the version sibling to "MLflow - <version>" (MLflow main UI).
+      var sib=a.nextElementSibling;
+      while(sib){
+        var text=(sib.textContent||'').trim();
+        var m=text.match(/(\\d+(?:\\.\\d+)+)\\s*$/);
+        if(m){
+          var desired='MLflow - '+m[1];
+          if(text!==desired)sib.textContent=desired;
+          break;
+        }
+        sib=sib.nextElementSibling;
+      }
+    }
+    // Clean up any stale EG-logo imgs left by older versions of this script
+    // (it used to inject into a[href="/"] on the OIDC nav menu).
+    var stale=document.querySelectorAll('a[href="/"] img[data-eg-logo]');
+    for(var s=0;s<stale.length;s++){
+      var sa=stale[s].parentElement;
+      stale[s].remove();
+      if(sa){
+        var hidden=sa.querySelectorAll('svg[style*="display: none"],img[style*="display: none"]');
+        for(var h=0;h<hidden.length;h++)hidden[h].style.display='';
+      }
+    }
+  }
+  function start(){
+    r();
+    new MutationObserver(r).observe(document.documentElement,{childList:true,subtree:true});
+  }
+  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',start);}
+  else{start();}
+})();"""
+
+_LOGO_INJECTION = '<script src="/eg-static/logo.js" defer></script>'
+
+
+def _inject_logo_replacement(content: bytes) -> bytes:
+    try:
+        html = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    if "</body>" in html:
+        html = html.replace("</body>", f"{_LOGO_INJECTION}</body>", 1)
+    elif "</head>" in html:
+        html = html.replace("</head>", f"{_LOGO_INJECTION}</head>", 1)
+    else:
+        html = html + _LOGO_INJECTION
+    return html.encode("utf-8")
 
 
 @app.api_route("/{path:path}", methods=ALL_METHODS)
