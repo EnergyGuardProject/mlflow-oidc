@@ -647,6 +647,19 @@ async def _forward_request(request: Request, path: str) -> Response:
 
     response_headers = _rewrite_logout_location(path, request, response_headers)
 
+    # A successful /callback mints a fresh session for the user.  Clear any
+    # leftover revocation from a prior logout so the very next request isn't
+    # bounced back to the login screen.  (Without this, the user has to
+    # "log in" twice after each logout — Keycloak SSO is still active, but
+    # the proxy's revocation list isn't.)
+    if path == "/callback":
+        for cookie_header in set_cookie_headers:
+            if not cookie_header.startswith("session="):
+                continue
+            fresh_user = _username_from_set_cookie(cookie_header)
+            if fresh_user and _revoked_users.pop(fresh_user, None) is not None:
+                logger.info("Cleared stale revocation after /callback for %s", fresh_user)
+
     content = upstream_response.content
     if "text/html" in upstream_response.headers.get("content-type", "").lower():
         content = _inject_logo_replacement(content)
