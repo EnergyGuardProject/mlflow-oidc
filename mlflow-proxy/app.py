@@ -35,15 +35,6 @@ _revoked_users: dict[str, float] = {}  # username -> monotonic timestamp
 ADMIN_GROUP_NAME = os.getenv("ADMIN_GROUP_NAME", "mlflow-admins")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
 KEYCLOAK_LOGOUT_CLIENT_ID = os.getenv("KEYCLOAK_LOGOUT_CLIENT_ID", "").strip()
-KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES = tuple(
-    header.strip().lower()
-    for header in os.getenv(
-        "KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES",
-        "x-auth-request-id-token,x-forwarded-id-token,authorization",
-    ).split(",")
-    if header.strip()
-)
-KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME = os.getenv("KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME", "").strip()
 MLFLOW_TRACKING_USERNAME = os.getenv("MLFLOW_TRACKING_USERNAME", "").strip()
 MLFLOW_TRACKING_PASSWORD = os.getenv("MLFLOW_TRACKING_PASSWORD", "").strip()
 EG_LOGO_PATH = os.getenv("EG_LOGO_PATH", "/app/images/logo/EnergyGuard_Site-1024x640.png")
@@ -123,19 +114,6 @@ def _decode_jwt_payload(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(seg))
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
-
-
-@app.get("/backchannel-logout")
-async def backchannel_logout_info() -> dict:
-    """Browser-friendly check — confirms the endpoint is live."""
-    return {
-        "endpoint": "/backchannel-logout",
-        "method": "POST",
-        "description": "Keycloak backchannel logout receiver. Configure this URL in Keycloak client settings.",
-        "revoked_users_count": len(_revoked_users),
-        "revoked_users": list(_revoked_users.keys()),
-        "keycloak_admin_api_configured": bool(KEYCLOAK_ISSUER_URL and os.getenv("KC_CLIENT_ID") and os.getenv("KC_CLIENT_SECRET")),
-    }
 
 
 async def _resolve_keycloak_sub_to_email(sub: str) -> str | None:
@@ -229,10 +207,6 @@ async def backchannel_logout(request: Request) -> Response:
     logger.info("backchannel-logout: revoked user %s, total revoked: %d", username, len(_revoked_users))
     return JSONResponse(status_code=200, content={"status": "ok"})
 
-
-def _split_jwt(token: str) -> list[str]:
-    parts = token.split(".")
-    return parts if len(parts) == 3 else []
 
 def _decode_basic_auth_credentials(request: Request) -> tuple[str, str] | None:
     raw_authorization = request.headers.get("authorization", "")
@@ -402,30 +376,6 @@ async def _is_admin(request: Request) -> bool:
     return False
 
 
-def _extract_logout_id_token(request: Request) -> str | None:
-    for header_name in KEYCLOAK_LOGOUT_ID_TOKEN_HEADER_CANDIDATES:
-        raw_value = request.headers.get(header_name)
-        if not raw_value:
-            continue
-        if header_name == "authorization":
-            scheme, _, token = raw_value.partition(" ")
-            if scheme.lower() != "bearer" or not token:
-                continue
-            candidate = token.strip()
-        else:
-            candidate = raw_value.strip()
-
-        if _split_jwt(candidate):
-            return candidate
-
-    if KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME:
-        cookie_value = request.cookies.get(KEYCLOAK_LOGOUT_ID_TOKEN_COOKIE_NAME, "").strip()
-        if cookie_value and _split_jwt(cookie_value):
-            return cookie_value
-
-    return None
-
-
 def _username_from_set_cookie(set_cookie_value: str) -> str:
     """Decode the Flask session payload out of a ``Set-Cookie: session=…`` header."""
     cookie_part = set_cookie_value.split(";", 1)[0]
@@ -466,22 +416,14 @@ def _build_keycloak_logout_url(request: Request) -> str | None:
     in that case there is nothing safe to redirect to, so callers should fall
     back to leaving the upstream redirect alone.
     """
-    if not KEYCLOAK_ISSUER_URL:
-        return None
-
-    id_token_hint = _extract_logout_id_token(request)
-    if not id_token_hint and not KEYCLOAK_LOGOUT_CLIENT_ID:
+    if not KEYCLOAK_ISSUER_URL or not KEYCLOAK_LOGOUT_CLIENT_ID:
         return None
 
     original_host = request.headers.get("host", "").strip()
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     post_logout_redirect = f"{proto}://{original_host}/" if original_host else None
 
-    query_items: list[tuple[str, str]] = []
-    if id_token_hint:
-        query_items.append(("id_token_hint", id_token_hint))
-    if KEYCLOAK_LOGOUT_CLIENT_ID:
-        query_items.append(("client_id", KEYCLOAK_LOGOUT_CLIENT_ID))
+    query_items: list[tuple[str, str]] = [("client_id", KEYCLOAK_LOGOUT_CLIENT_ID)]
     if post_logout_redirect:
         query_items.append(("post_logout_redirect_uri", post_logout_redirect))
 
@@ -504,21 +446,15 @@ def _rewrite_logout_location(path: str, request: Request, headers: dict[str, str
 
     if "/protocol/openid-connect/logout" in parsed.path:
         # Upstream already points at Keycloak; just enrich the query with
-        # id_token_hint or client_id so the IdP can identify the session.
+        # client_id so the IdP can identify the session.
         query_items = parse_qsl(parsed.query, keep_blank_values=True)
         query_keys = {key for key, _ in query_items}
-        if "id_token_hint" in query_keys:
+        if "id_token_hint" in query_keys or "client_id" in query_keys:
             return headers
-        if "post_logout_redirect_uri" not in query_keys:
+        if "post_logout_redirect_uri" not in query_keys or not KEYCLOAK_LOGOUT_CLIENT_ID:
             return headers
 
-        id_token_hint = _extract_logout_id_token(request)
-        if id_token_hint:
-            query_items.append(("id_token_hint", id_token_hint))
-        elif "client_id" not in query_keys and KEYCLOAK_LOGOUT_CLIENT_ID:
-            query_items.append(("client_id", KEYCLOAK_LOGOUT_CLIENT_ID))
-        else:
-            return headers
+        query_items.append(("client_id", KEYCLOAK_LOGOUT_CLIENT_ID))
 
         headers[location_key] = urlunsplit(
             (
