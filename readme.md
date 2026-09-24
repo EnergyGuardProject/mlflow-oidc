@@ -1,15 +1,13 @@
 # MLflow with OIDC for EnergyGuard
 
-This repository runs the [MLflow Tracking Server](https://github.com/mlflow/mlflow) with the [mlflow-oidc-auth plugin](https://github.com/mlflow-oidc/mlflow-oidc-auth), so that users log in to MLflow through Keycloak. A reverse proxy (`mlflow-proxy`) sits in front of the server. It restricts some MLflow actions to admins, shortens the session cookie lifetime, handles Keycloak single logout and replaces the MLflow logo with the EnergyGuard logo.
+This repository runs the [MLflow Tracking Server with oidc-auth plugin](https://github.com/mlflow-oidc/mlflow-oidc-auth), so that users log in to MLflow through Keycloak. A reverse proxy (`mlflow-proxy`) sits in front of the server. It restricts some MLflow actions to admins, shortens the session cookie lifetime, handles Keycloak single logout and replaces the MLflow logo with the EnergyGuard logo.
 
 ## Components
 
-| Service | Built from | Port | Role |
-|---|---|---|---|
-| `mlflow-oidc` | `Dockerfile` in the repository root | 5001 | MLflow 3.8.1 with mlflow-oidc-auth 6.6.3 |
-| `mlflow-proxy` | `mlflow-proxy/` | 8069 | FastAPI reverse proxy in front of `mlflow-oidc` |
-
-The package versions of the MLflow server are pinned in `pyproject.toml` and `uv.lock`.
+| Service | Built from | Role |
+|---|--|---|
+| `mlflow-oidc` | `Dockerfile` in the repository root | MLflow 3.8.1 with mlflow-oidc-auth 6.6.3 |
+| `mlflow-proxy` | `mlflow-proxy/` | FastAPI reverse proxy in front of `mlflow-oidc` |
 
 The MLflow server stores runs and experiments in the PostgreSQL database on host `pgdb` and stores artifacts in the S3 bucket `BUCKET_NAME`. Clients upload and download artifacts through the MLflow server, which is started with `--serve-artifacts`. The database and the S3 storage (MinIO) are not part of this compose file and must be reachable on the same Docker network.
 
@@ -18,13 +16,11 @@ The MLflow server stores runs and experiments in the PostgreSQL database on host
 Both services are defined in `docker-compose.yaml` at the root of this repository.
 
 ```bash
-cd /home/energyguard/mlflow-oidc/mlflow-tracking-server-docker
+cd /path/to/mlflow-tracking-server-docker
 docker compose up -d --build
 ```
 
-Both containers join the external Docker network `nginxproxy_energyguard_net`, which must exist before you start them. The proxy forwards requests to `http://mlflow-oidc:5001`. Point Nginx Proxy Manager at the `mlflow-proxy` container on port 8069, not at `mlflow-oidc`.
-
-Compose reads its settings from `.env` in the repository root.
+Both containers join the external Docker network `nginxproxy_energyguard_net`, which must exist before you start them. The proxy forwards requests to `http://mlflow-oidc:5001`.
 
 ## MLflow server settings
 
@@ -41,9 +37,8 @@ These variables in `.env` configure the `mlflow-oidc` service.
 | `OIDC_ADMIN_GROUP_NAME` | Keycloak group whose members are MLflow admins |
 | `DEFAULT_MLFLOW_PERMISSION` | Permission that users get on resources they have no explicit permission for |
 | `DEFAULT_LANDING_PAGE_IS_PERMISSIONS` | Whether users land on the permissions page after login |
-| `OIDC_KEYCLOAK_COMPATIBILITY_MODE` | Sends `client_id` on logout when no ID token is available |
 | `OIDC_USERS_DB_URI` | Database where mlflow-oidc-auth keeps users, groups and permissions |
-| `SECRET_KEY` | Key that signs the session cookie. Keep it the same across restarts, or all users are logged out. Generate it once with `openssl rand -hex 32`. |
+| `SECRET_KEY` | Key that signs the session cookie. Generated once with `openssl rand -hex 32`. |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE` | MLflow backend store on `pgdb` |
 | `BUCKET_NAME` | S3 bucket for artifacts |
 | `MLFLOW_S3_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | S3 endpoint and credentials |
@@ -53,7 +48,7 @@ These variables in `.env` configure the `mlflow-oidc` service.
 
 ### Admin checks
 
-A request counts as coming from an admin when one of the following is true.
+A request is considered as coming from an admin from the proxy when one of the following is true.
 
 1. It sends Basic auth credentials that match `MLFLOW_TRACKING_USERNAME` and `MLFLOW_TRACKING_PASSWORD` (the service account).
 2. The `username` in its MLflow session cookie matches `MLFLOW_TRACKING_USERNAME`.
@@ -85,21 +80,13 @@ mlflow-oidc-auth sets a session cookie that lasts 14 days and offers no setting 
 
 ### Logout
 
-When a user logs out of MLflow, the proxy sends the browser to the Keycloak logout endpoint so that the Keycloak session ends as well. The redirect includes the client ID of the MLflow Keycloak client, taken from `KEYCLOAK_LOGOUT_CLIENT_ID`. After logout Keycloak sends the user back to the MLflow home page. This redirect only works when `KC_ISSUER_URL` is set.
+When a user logs out of MLflow, the proxy sends the browser to the Keycloak logout endpoint so that the Keycloak session ends as well. The redirect includes the client ID of the MLflow Keycloak client, taken from `KEYCLOAK_LOGOUT_CLIENT_ID`. After logout Keycloak sends the user back to the MLflow home page.
 
 ### Backchannel logout
 
-When a user logs out of any application in the Keycloak realm, for example JupyterHub, Keycloak can notify the proxy at `POST /backchannel-logout`. The proxy reads the user's email from the `logout_token`. If the token only carries the Keycloak user ID (`sub`), the proxy looks up the email through the Keycloak admin API with `KC_ISSUER_URL`, `KC_CLIENT_ID` and `KC_CLIENT_SECRET`. That client needs a service account that is allowed to view users (the `view-users` role of `realm-management`).
+When a user logs out of an application in the Keycloak realm, for example JupyterHub, Keycloak can notify the proxy at `POST /backchannel-logout`. The proxy reads the user's email from the `logout_token`. If the token only carries the Keycloak user ID (`sub`), the proxy looks up the email through the Keycloak admin API with `KC_ISSUER_URL`, `KC_CLIENT_ID` and `KC_CLIENT_SECRET`. That client needs a service account that is allowed to view users (the `view-users` role of `realm-management`).
 
 The user is then added to a revocation list. On their next request the proxy deletes their session cookie and redirects them to `/`, which starts a new login. Entries expire after twice `SESSION_COOKIE_MAX_AGE` seconds. The list is kept in memory, so it is cleared when the container restarts.
-
-To set up backchannel logout in Keycloak, follow these steps.
-
-1. In the Keycloak admin console, open **Clients** and select `mlflow-energyguard`.
-2. Open **Logout settings**. In some Keycloak versions these are on the **Advanced** tab.
-3. Set **Backchannel logout URL** to an address of the proxy that Keycloak can reach. On the same Docker network this is `http://mlflow-proxy:8069/backchannel-logout`. Through Nginx it is `https://mlflow.energy-guard.eu/backchannel-logout`.
-4. Turn on **Backchannel logout session required**.
-5. Save.
 
 ### EnergyGuard branding
 
@@ -128,7 +115,7 @@ Compose sets these variables for the `mlflow-proxy` service. It passes `SESSION_
 
 ## Upstream
 
-This repository is a fork of [mlflow-oidc/mlflow-tracking-server-docker](https://github.com/mlflow-oidc/mlflow-tracking-server-docker). The upstream project publishes prebuilt images on [Artifact Hub](https://artifacthub.io/packages/search?repo=mlflow-oidc-tracking-server) and a [Helm chart](https://github.com/mlflow-oidc/helm) for Kubernetes. The EnergyGuard deployment builds its images locally with Docker Compose.
+This repository is a fork of [mlflow-oidc/mlflow-tracking-server-docker](https://github.com/mlflow-oidc/mlflow-tracking-server-docker). 
 
 ## License
 
