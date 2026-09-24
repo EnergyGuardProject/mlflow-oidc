@@ -386,14 +386,20 @@ async def _is_admin_api_call(request: Request, username) -> set[str]:
 
 async def _is_admin(request: Request) -> bool:
     session_username = _extract_session_username(request)
-    print("session_username", session_username)
-    if not session_username:
-        return False
+    if session_username:
+        if MLFLOW_TRACKING_USERNAME and session_username == MLFLOW_TRACKING_USERNAME.lower():
+            return True
+        return await _is_admin_api_call(request, session_username)
 
-    if MLFLOW_TRACKING_USERNAME and session_username == MLFLOW_TRACKING_USERNAME.lower():
-        return True
+    # No Flask session cookie (typical for API clients using a PAT). Fall back
+    # to the username carried in the Basic-auth header so admin-only endpoints
+    # work for admins authenticating via PAT, not just the browser UI.
+    creds = _decode_basic_auth_credentials(request)
+    if creds:
+        username, _ = creds
+        return await _is_admin_api_call(request, username.strip().lower())
 
-    return await _is_admin_api_call(request, session_username)
+    return False
 
 
 def _extract_logout_id_token(request: Request) -> str | None:
