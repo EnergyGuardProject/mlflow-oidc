@@ -478,6 +478,67 @@ def _rewrite_logout_location(path: str, request: Request, headers: dict[str, str
     return headers
 
 
+# ---------------------------------------------------------------------------
+# Missing artifacts: 500 -> 404
+# ---------------------------------------------------------------------------
+# MLflow's GET /mlflow-artifacts/artifacts/<path> handler does not catch the
+# storage backend's "no such key" error, so a missing artifact comes back as a
+# 500. The MLflow client retries 500s with backoff (7 retries, ~4 minutes), and
+# MLflow 3 hits exactly this on every runs:/<run_id>/model load: it first asks
+# for the run artifact "model" (which lives under models/m-<id>/ since MLflow 3)
+# and only then falls back to the logged model. Answering 404 makes the client
+# give up straight away and take the fallback.
+#
+# Only a 500 is checked, and only for GET downloads: the proxy lists the parent
+# directory with the caller's own credentials and returns 404 when no file of
+# that name is there. Any other 500 (storage down, a real server error) is
+# passed through unchanged.
+# ---------------------------------------------------------------------------
+ARTIFACT_DOWNLOAD_PREFIXES = (
+    "/api/2.0/mlflow-artifacts/artifacts/",
+    "/ajax-api/2.0/mlflow-artifacts/artifacts/",
+)
+
+
+def _artifact_download_path(path: str) -> str | None:
+    """The artifact path of a GET download URL, or None for any other URL."""
+    for prefix in ARTIFACT_DOWNLOAD_PREFIXES:
+        if path.startswith(prefix):
+            artifact_path = path[len(prefix):].strip("/")
+            return artifact_path or None
+    return None
+
+
+async def _missing_artifact_response(request: Request, artifact_path: str) -> Response | None:
+    """A 404 response when ``artifact_path`` is not a file in the artifact store,
+    or None when it is (or when that cannot be determined)."""
+    parent, _, name = artifact_path.rpartition("/")
+    list_url = httpx.URL(f"{MLFLOW_UPSTREAM_URL}/api/2.0/mlflow-artifacts/artifacts")
+    if parent:
+        list_url = list_url.copy_merge_params({"path": parent})
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+            listing = await client.get(list_url, headers=_build_upstream_headers(request))
+        if listing.status_code != 200:
+            return None
+        files = listing.json().get("files", [])
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return None
+
+    if any(f.get("path") == name and not f.get("is_dir") for f in files if isinstance(f, dict)):
+        return None  # the file exists, so the 500 is a real error
+
+    logger.info("Artifact %s does not exist: returning 404 instead of upstream 500", artifact_path)
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error_code": "RESOURCE_DOES_NOT_EXIST",
+            "message": f"Artifact '{artifact_path}' does not exist.",
+        },
+    )
+
+
 async def _forward_request(request: Request, path: str) -> Response:
     upstream_url = httpx.URL(f"{MLFLOW_UPSTREAM_URL}/{path.lstrip('/')}")
     query_string = request.url.query.encode("utf-8")
@@ -496,7 +557,14 @@ async def _forward_request(request: Request, path: str) -> Response:
             headers=headers,
         )
 
-    skip_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    if upstream_response.status_code == 500 and request.method == "GET":
+        artifact_path = _artifact_download_path(path)
+        if artifact_path:
+            missing = await _missing_artifact_response(request, artifact_path)
+            if missing is not None:
+                return missing
+
+    skip_headers ={"content-encoding", "content-length", "transfer-encoding", "connection"}
     response_headers: dict[str, str] = {}
     set_cookie_headers: list[str] = []
 
